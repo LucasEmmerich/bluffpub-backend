@@ -114,8 +114,10 @@ export default class Game {
     };
 
     private removeCardsFromPlayerHand = (move: Move) => {
-        const hand = this.hands.find((h) => h.player.id === move.player.id)!;
-        hand.cards = hand.cards.filter((c) => !move.cardsDropped.some((d) => d.id === c.id));
+        const hand = this.hands.find((h) => h.player.id === move.player.id);
+        if (!hand) return;
+        const droppedIds = new Set(move.cardsDropped.map((d) => d.id));
+        hand.cards = hand.cards.filter((c) => !droppedIds.has(c.id));
     };
 
     private setNextPlayer = () => {
@@ -140,12 +142,17 @@ export default class Game {
     }
 
     public forfeitTurn(): BluffResult {
-        const currentHand = this.hands.find((h) => h.player.id === this.turn.id)!;
+        const currentHand = this.hands.find((h) => h.player.id === this.turn.id);
+        if (!currentHand) {
+            this.setNextPlayer();
+            return { bluffed: false, loser: this.turn, eliminated: false, gameOver: false, tableCards: [] };
+        }
         currentHand.life--;
         const eliminated = currentHand.life <= 0;
         if (eliminated) this.eliminatePlayer(currentHand.player.id);
         const gameOver = this.players.length <= 1;
-        if (!gameOver) this.startNewRound();
+        if (gameOver) this.matchStarted = false;
+        else this.startNewRound();
         return {
             bluffed: false,
             loser: currentHand.player,
@@ -156,20 +163,24 @@ export default class Game {
         };
     }
 
-    public giveUp(playerId: string): BluffResult {
-        const hand = this.hands.find((h) => h.player.id === playerId)!;
-        const wasCurrentTurn = this.turn.id === playerId;
-        hand.life = 0;
+
+    public playerLeft(playerId: string): BluffResult {
+        const hand = this.hands.find((h) => h.player.id === playerId);
+        if (!hand) {
+            return { bluffed: false, loser: { id: playerId, username: '', avatar: 0 }, eliminated: false, gameOver: false, tableCards: [] };
+        }
+        const tableCards = [...this.table.cards];
         this.eliminatePlayer(playerId);
         const gameOver = this.players.length <= 1;
-        if (!gameOver && wasCurrentTurn) this.startNewRound();
+        if (gameOver) this.matchStarted = false;
+        else this.startNewRound();
         return {
             bluffed: false,
             loser: hand.player,
             eliminated: true,
             gameOver,
             winner: gameOver ? this.players[0] : undefined,
-            tableCards: [],
+            tableCards,
         };
     }
 
@@ -180,8 +191,9 @@ export default class Game {
 
         const tableCards = [...this.table.cards];
         const lastMove = this.getLastMove();
-        const lastHand = this.hands.find((h) => h.player.id === lastMove.player.id)!;
-        const callerHand = this.hands.find((h) => h.player.id === callerPlayer.id)!;
+        const lastHand = this.hands.find((h) => h.player.id === lastMove.player.id);
+        const callerHand = this.hands.find((h) => h.player.id === callerPlayer.id);
+        if (!lastHand || !callerHand) throw new Error('Hand not found during bluff resolution.');
 
         const bluffed = this.lastPlayerBluffed();
         const loserHand = bluffed ? lastHand : callerHand;
@@ -193,9 +205,8 @@ export default class Game {
         }
 
         const gameOver = this.players.length <= 1;
-        if (!gameOver) {
-            this.startNewRound();
-        }
+        if (gameOver) this.matchStarted = false;
+        else this.startNewRound();
 
         return {
             bluffed,

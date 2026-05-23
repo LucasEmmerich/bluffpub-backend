@@ -39,17 +39,21 @@ io.on('connection', (socket: Socket) => {
                 break;
             }
         }
+        const disconnectedRoom = server.findRoomBySocketId(socket.id);
+        if (disconnectedRoom) gameController.handlePlayerLeave(disconnectedRoom.id, socket.id);
         roomController.handleDisconnect(socket);
     });
 
     socket.on('create-room', (payload) => roomController.createRoom(socket, payload));
     socket.on('join-room', (payload) => roomController.joinRoom(socket, payload));
-    socket.on('left-room', (payload) => roomController.leaveRoom(socket, payload.id));
+    socket.on('left-room', (payload) => {
+        gameController.handlePlayerLeave(payload.id, socket.id);
+        roomController.leaveRoom(socket, payload.id);
+    });
 
     socket.on('game-start', (payload) => gameController.startGame(socket, payload));
     socket.on('bluff-intent', (payload) => gameController.bluffIntent(socket, payload));
     socket.on('drop-cards', (payload) => gameController.dropCards(socket, payload));
-    socket.on('give-up', (payload) => gameController.giveUp(socket, payload));
 
     if (process.env.NODE_ENV !== 'production') {
         socket.on('dev-sandbox', (payload) => gameController.devSandbox(socket, payload));

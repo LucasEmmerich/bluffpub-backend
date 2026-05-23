@@ -1,8 +1,14 @@
 import Server from '../models/Server.js';
-import Game, { Move } from '../models/Game.js';
+import Game from '../models/Game.js';
 import Room from '../models/Room.js';
 import Player from '../models/Player.js';
 import { Socket, Server as SocketIOServer } from 'socket.io';
+
+type ClientMove = {
+    player: Player;
+    cardIds: number[];
+    liarCall: boolean;
+};
 
 const TURN_TIMEOUT_MS = 20000;
 const INTER_TURN_DELAY_MS = 2000;
@@ -29,19 +35,20 @@ export default class GameController {
     private resolveSkips(roomId: string) {
         const room = this.server.getRoom(roomId);
         if (!room || !room.game || !room.game.matchStarted) return;
-        if (this.currentPlayerHasNoCards(roomId)) {
+        let guard = room.game.hands.length;
+        while (this.currentPlayerHasNoCards(roomId) && guard-- > 0) {
             room.game.skipTurn();
             this.io.to(roomId).emit('turn-skipped', room.game);
-            this.resolveSkips(roomId);
-        } else {
-            this.startTurnTimer(roomId);
         }
+        this.startTurnTimer(roomId);
     }
 
     private startTurnTimer(roomId: string) {
         this.clearTurnTimer(roomId);
         const timer = setTimeout(() => {
             try {
+                if (!this.turnTimers.has(roomId)) return;
+                this.turnTimers.delete(roomId);
                 const room = this.server.getRoom(roomId);
                 if (!room || !room.game || !room.game.matchStarted) return;
                 if (this.currentPlayerHasNoCards(roomId)) {
@@ -73,8 +80,29 @@ export default class GameController {
         }
     }
 
+    public handlePlayerLeave(roomId: string, playerId: string) {
+        try {
+            const room = this.server.getRoom(roomId);
+            if (!room || !room.game || !room.game.matchStarted) return;
+            this.clearTurnTimer(roomId);
+            const result = room.game.playerLeft(playerId);
+            this.io.to(roomId).emit('player-left-game', { game: room.game, result });
+            if (result.gameOver && result.winner) {
+                room.recordWin(result.winner.id);
+                this.io.to(roomId).emit('leaderboard-updated', room.leaderboard);
+            }
+            if (!result.gameOver)
+                setTimeout(() => this.resolveSkips(roomId), INTER_TURN_DELAY_MS);
+        } catch (e) {
+            console.error(e);
+        }
+    }
+
     public bluffIntent(_socket: Socket, payload: { room: { id: string }; callerId: string }) {
         try {
+            const room = this.server.getRoom(payload.room.id);
+            if (!room || !room.game || !room.game.matchStarted) return;
+            if (room.game.turn.id !== payload.callerId) return;
             this.clearTurnTimer(payload.room.id);
             this.io.to(payload.room.id).emit('bluff-intent', { callerId: payload.callerId });
         } catch (e) {
@@ -85,6 +113,8 @@ export default class GameController {
     public startGame(socket: Socket, payload: { room: { id: string }; player: { id: string } }) {
         try {
             const room = this.server.getRoom(payload.room.id);
+            if (!room) return;
+            if (room.game?.matchStarted) return;
             if (room.roomOwner?.id !== payload.player.id) {
                 socket.emit('send-notification', {
                     type: 'error',
@@ -96,6 +126,7 @@ export default class GameController {
                 socket.emit('send-notification', { type: 'error', message: 'At least 2 players are required.' });
                 return;
             }
+            this.clearTurnTimer(room.id);
             room.game = new Game(room.players);
             room.ensurePlayersInLeaderboard();
             const totalCards = 5 * room.players.length;
@@ -153,45 +184,38 @@ export default class GameController {
         }, 150);
     }
 
-    public giveUp(socket: Socket, payload: { room: { id: string }; playerId: string }) {
-        try {
-            const room = this.server.getRoom(payload.room.id);
-            if (!room || !room.game || !room.game.matchStarted) return;
-            const wasCurrentTurn = room.game.turn.id === payload.playerId;
-            if (wasCurrentTurn) this.clearTurnTimer(room.id);
-            const result = room.game.giveUp(payload.playerId);
-            this.io.to(room.id).emit('player-gave-up', { game: room.game, result });
-            if (result.gameOver && result.winner) {
-                room.recordWin(result.winner.id);
-                this.io.to(room.id).emit('leaderboard-updated', room.leaderboard);
-            }
-            if (!result.gameOver && wasCurrentTurn) setTimeout(() => this.resolveSkips(room.id), INTER_TURN_DELAY_MS);
-        } catch (e) {
-            console.error(e);
-        }
-    }
 
-    public dropCards(socket: Socket, payload: { room: { id: string }; move: Move }) {
+    public dropCards(socket: Socket, payload: { room: { id: string }; move: ClientMove }) {
         try {
             const { move } = payload;
             const room = this.server.getRoom(payload.room.id);
-            this.clearTurnTimer(room.id);
+            if (!room || !room.game || !room.game.matchStarted) return;
+            if (room.game.turn.id !== move.player.id) return;
 
             if (move.liarCall) {
-                const result = room.game!.callBluff(move.player);
+                if (room.game.table.moves.length === 0) return;
+                this.clearTurnTimer(room.id);
+                const result = room.game.callBluff(move.player);
                 this.io.to(room.id).emit('bluff-called', { game: room.game, result, callerId: move.player.id });
                 if (result.gameOver && result.winner) {
                     room.recordWin(result.winner.id);
                     this.io.to(room.id).emit('leaderboard-updated', room.leaderboard);
                 }
+                if (room.game.matchStarted)
+                    setTimeout(() => this.resolveSkips(room.id), LIFE_LOSS_REVEAL_MS + INTER_TURN_DELAY_MS);
             } else {
-                room.game!.dropCards(move);
+                if (!move.cardIds?.length) return;
+                const hand = room.game.hands.find((h) => h.player.id === move.player.id);
+                if (!hand) return;
+                const cardIdSet = new Set(move.cardIds);
+                const cardsDropped = hand.cards.filter((c) => cardIdSet.has(c.id));
+                if (!cardsDropped.length) return;
+                this.clearTurnTimer(room.id);
+                room.game.dropCards({ player: move.player, cardsDropped, liarCall: false });
                 this.io.to(room.id).emit('cards-dropped', room.game);
+                if (room.game.matchStarted)
+                    setTimeout(() => this.resolveSkips(room.id), INTER_TURN_DELAY_MS);
             }
-
-            if (!room.game!.matchStarted) return;
-            const delay = move.liarCall ? LIFE_LOSS_REVEAL_MS + INTER_TURN_DELAY_MS : INTER_TURN_DELAY_MS;
-            setTimeout(() => this.resolveSkips(room.id), delay);
         } catch (error) {
             console.error(error);
         }
